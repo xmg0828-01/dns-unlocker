@@ -1,6 +1,7 @@
 #!/bin/bash
 # DNS+SS解锁脚本 v2.0
 # 支持DNS解锁和Shadowsocks节点解锁
+# 支持Netflix、Disney+、YouTube等流媒体解锁
 # 作者: Claude
 
 # 颜色定义
@@ -14,7 +15,7 @@ PLAIN="\033[0m"
 CONFIG_DIR="/etc/dnsmasq.d"
 DNSMASQ_CONFIG="/etc/dnsmasq.conf"
 SS_CONFIG="/etc/shadowsocks-libev/config.json"
-SUBSCRIBE_CONFIG="/etc/shadowsocks-libev/subscribe.conf"
+SS_NODE_CONFIG="/etc/shadowsocks-libev/nodes/"
 DNS_CONFIG="/etc/resolv.conf"
 
 # 检查root权限
@@ -64,6 +65,9 @@ install_ss() {
   else
     apt install -y shadowsocks-libev simple-obfs
   fi
+  
+  # 创建SS配置目录
+  mkdir -p ${SS_NODE_CONFIG}
 }
 
 # 配置DNS服务
@@ -118,7 +122,7 @@ EOF
   systemctl restart dnsmasq
 }
 
-# 配置Disney+解锁  
+# 配置Disney+解锁
 setup_disney() {
   echo -e "${BLUE}配置Disney+解锁...${PLAIN}"
   read -p "请输入Disney+解锁IP: " disney_ip
@@ -162,10 +166,6 @@ EOF
 # SS节点管理相关函数
 # ==================
 
-# SS节点配置结构
-SS_NODE_CONFIG="/etc/shadowsocks-libev/nodes/"
-mkdir -p $SS_NODE_CONFIG
-
 # 添加SS节点
 add_ss_node() {
   echo -e "${BLUE}添加SS节点${PLAIN}"
@@ -193,7 +193,7 @@ add_ss_manual() {
   [ -z "$method" ] && method="aes-256-gcm"
   
   # 生成节点配置文件
-  cat > ${SS_NODE_CONFIG}${name}.json << EOF
+  cat > "${SS_NODE_CONFIG}${name}.json" << EOF
 {
     "server":"${server}",
     "server_port":${port},
@@ -224,23 +224,23 @@ add_ss_subscribe() {
   if [ -z "$subscribe_content" ]; then
     echo -e "${RED}获取订阅内容失败${PLAIN}"
     return
-  }
+  fi
 
   # 解码Base64内容
-  nodes_config=$(echo $subscribe_content | base64 -d)
+  nodes_config=$(echo "$subscribe_content" | base64 -d)
   
   # 解析并保存每个节点
   echo "$nodes_config" | while IFS= read -r line; do
     if [[ $line =~ ^ss:// ]]; then
-      node_info=$(echo ${line#ss://} | base64 -d)
-      method=$(echo $node_info | cut -d: -f1)
-      password=$(echo $node_info | cut -d: -f2 | cut -d@ -f1)
-      server=$(echo $node_info | cut -d@ -f2 | cut -d: -f1)
-      port=$(echo $node_info | cut -d: -f3)
-      name=$(echo $node_info | cut -d# -f2)
+      node_info=$(echo "${line#ss://}" | base64 -d)
+      method=$(echo "$node_info" | cut -d: -f1)
+      password=$(echo "$node_info" | cut -d: -f2 | cut -d@ -f1)
+      server=$(echo "$node_info" | cut -d@ -f2 | cut -d: -f1)
+      port=$(echo "$node_info" | cut -d: -f3)
+      name=$(echo "$node_info" | cut -d# -f2)
       
       # 保存节点配置
-      cat > ${SS_NODE_CONFIG}${name}.json << EOF
+      cat > "${SS_NODE_CONFIG}${name}.json" << EOF
 {
     "server":"${server}",
     "server_port":${port},
