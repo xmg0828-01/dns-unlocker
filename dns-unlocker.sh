@@ -470,22 +470,45 @@ test_ss_nodes() {
       else
         echo "  启动节点..."
         start_ss_node "$config_name"
-        sleep 3
+        sleep 5
       fi
       
       echo "  测试连接..."
-      local test_result=$(timeout 15 curl -s --socks5 "127.0.0.1:$local_port" "http://httpbin.org/ip" 2>/dev/null)
       
+      local test_success=false
+      
+      # 测试1: HTTP请求
+      local test_result=$(timeout 10 curl -s --socks5 "127.0.0.1:$local_port" "http://httpbin.org/ip" 2>/dev/null)
       if [ -n "$test_result" ]; then
         local ip=$(echo "$test_result" | jq -r '.origin' 2>/dev/null)
         if [ -n "$ip" ] && [ "$ip" != "null" ]; then
-          echo -e "  ${GREEN}✓ 连接成功，出口IP: $ip${NC}"
-          ((success_count++))
-        else
-          echo -e "  ${RED}✗ 连接失败${NC}"
+          echo -e "  ${GREEN}✓ HTTP测试成功，出口IP: $ip${NC}"
+          test_success=true
         fi
-      else
-        echo -e "  ${RED}✗ 连接失败${NC}"
+      fi
+      
+      # 测试2: HTTPS请求
+      if [ "$test_success" = false ]; then
+        local https_result=$(timeout 10 curl -s --socks5 "127.0.0.1:$local_port" "https://api.ipify.org" 2>/dev/null)
+        if [ -n "$https_result" ] && [[ "$https_result" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo -e "  ${GREEN}✓ HTTPS测试成功，出口IP: $https_result${NC}"
+          test_success=true
+        fi
+      fi
+      
+      # 测试3: 简单连接测试
+      if [ "$test_success" = false ]; then
+        local simple_test=$(timeout 5 curl -s --socks5 "127.0.0.1:$local_port" "http://www.google.com" 2>/dev/null | head -c 10)
+        if [ -n "$simple_test" ]; then
+          echo -e "  ${YELLOW}⚠ 连接可用但IP检测失败${NC}"
+          test_success=true
+        else
+          echo -e "  ${RED}✗ 连接完全失败${NC}"
+        fi
+      fi
+      
+      if [ "$test_success" = true ]; then
+        ((success_count++))
       fi
       
       if [ "$was_running" = false ]; then
@@ -527,6 +550,88 @@ manage_ss_nodes() {
          ;;
     esac
   done
+}
+
+setup_iptables_rules() {
+  local service="$1"
+  local redsocks_port="$2"
+  local http_port="$3"
+  
+  echo -e "${BLUE}配置iptables规则...${NC}"
+  
+  # 清理旧规则
+  iptables -t nat -D OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports $http_port 2>/dev/null
+  iptables -t nat -D OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port 2>/dev/null
+  
+  # 根据服务配置特定规则
+  case $service in
+    "netflix")
+      # Netflix特定IP段
+      iptables -t nat -A OUTPUT -d 52.84.0.0/15 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      iptables -t nat -A OUTPUT -d 54.68.0.0/14 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      iptables -t nat -A OUTPUT -d 198.38.96.0/19 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      iptables -t nat -A OUTPUT -d 198.45.48.0/20 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      echo -e "${GREEN}已配置Netflix专用iptables规则${NC}"
+      ;;
+    "disney")
+      # Disney+特定IP段
+      iptables -t nat -A OUTPUT -d 23.40.0.0/12 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      iptables -t nat -A OUTPUT -d 199.7.160.0/19 -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      echo -e "${GREEN}已配置Disney+专用iptables规则${NC}"
+      ;;
+    *)
+      # 通用规则 - 更保守的方式
+      iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports $http_port
+      iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
+      echo -e "${GREEN}已配置通用iptables规则${NC}"
+      ;;
+  esac
+  
+  # 保存iptables规则
+  if command -v iptables-save > /dev/null; then
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  fi
+}
+
+setup_transparent_proxy() {
+  local service="$1"
+  local socks_port="$2"
+  local redsocks_port=$((8080 + $(echo "$service" | wc -c | tr -d ' ')))
+  
+  echo -e "${BLUE}配置透明代理...${NC}"
+  
+  # 停止可能存在的进程
+  pkill -f "redsocks.*${service}" 2>/dev/null
+  
+  # 配置redsocks
+  cat > "/etc/redsocks-${service}.conf" << EOFRED
+base {
+    log_debug = off;
+    log_info = on;
+    log = "file:/var/log/redsocks-${service}.log";
+    daemon = on;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = $redsocks_port;
+    ip = 127.0.0.1;
+    port = $socks_port;
+    type = socks5;
+}
+EOFRED
+  
+  # 启动redsocks
+  redsocks -c "/etc/redsocks-${service}.conf"
+  sleep 2
+  
+  # 配置iptables规则
+  setup_iptables_rules "$service" "$redsocks_port" "0"
+  
+  echo -e "${GREEN}透明代理配置完成${NC}"
+  echo -e "${YELLOW}Redsocks端口: $redsocks_port${NC}"
+  echo -e "${YELLOW}SOCKS5端口: $socks_port${NC}"
 }
 
 setup_service_with_ss() {
@@ -579,47 +684,31 @@ setup_service_with_ss() {
     
     echo -e "${BLUE}启动SS节点...${NC}"
     start_ss_node "$node_name"
+    sleep 3
     
     echo -e "${BLUE}配置透明代理...${NC}"
     setup_transparent_proxy "$service_name" "$local_port"
     
-    echo -e "${GREEN}$service_display 已配置使用SS节点 $node_name 进行解锁${NC}"
+    # 测试代理是否工作
+    echo -e "${BLUE}测试代理连接...${NC}"
+    local test_ip=$(timeout 10 curl -s --socks5 "127.0.0.1:$local_port" "https://api.ipify.org" 2>/dev/null)
+    if [ -n "$test_ip" ] && [[ "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo -e "${GREEN}✓ 代理测试成功，出口IP: $test_ip${NC}"
+      echo -e "${GREEN}$service_display 已配置使用SS节点 $node_name 进行解锁${NC}"
+      
+      # 提供使用说明
+      echo -e "${CYAN}使用提示:${NC}"
+      echo -e "${YELLOW}1. 透明代理已配置，相关流量会自动通过SS节点${NC}"
+      echo -e "${YELLOW}2. 手动代理设置: SOCKS5 127.0.0.1:$local_port${NC}"
+      echo -e "${YELLOW}3. 如需停用，请使用重置配置功能${NC}"
+    else
+      echo -e "${RED}✗ 代理测试失败，请检查SS节点配置${NC}"
+      echo -e "${YELLOW}尝试手动测试: curl --socks5 127.0.0.1:$local_port https://api.ipify.org${NC}"
+    fi
   else
     echo -e "${RED}无效的选择${NC}"
   fi
   read -p "按回车继续..." dummy
-}
-
-setup_transparent_proxy() {
-  local service="$1"
-  local socks_port="$2"
-  local redsocks_port=$((8080 + $(echo "$service" | wc -c | tr -d ' ')))
-  
-  cat > "/etc/redsocks-${service}.conf" << EOFRED
-base {
-    log_debug = off;
-    log_info = on;
-    log = "file:/var/log/redsocks-${service}.log";
-    daemon = on;
-    redirector = iptables;
-}
-
-redsocks {
-    local_ip = 127.0.0.1;
-    local_port = $redsocks_port;
-    ip = 127.0.0.1;
-    port = $socks_port;
-    type = socks5;
-}
-EOFRED
-  
-  pkill -f "redsocks.*${service}" 2>/dev/null
-  redsocks -c "/etc/redsocks-${service}.conf"
-  
-  iptables -t nat -D OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port 2>/dev/null
-  iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports $redsocks_port
-  
-  echo -e "${GREEN}透明代理配置完成，端口: $redsocks_port${NC}"
 }
 setup_netflix() {
   echo -e "${CYAN}===== 解锁Netflix =====${NC}"
